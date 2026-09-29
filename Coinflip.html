@@ -105,7 +105,7 @@
   // How often (ms) to poll the contract while waiting for Chainlink VRF to  
   // fulfill the bet in the background. This is a read-only poll — no wallet  
   // signature or preview involved, so there is nothing for the player to see.  
-  const RESOLVE_POLL_INTERVAL_MS = 2500;  
+  const RESOLVE_POLL_INTERVAL_MS = 500;  
   
   const HEADS_IMG = "logo_transparent.png";  
   const TAILS_IMG = "icon-app.svg";  
@@ -531,10 +531,34 @@
       setBusyLabel("Confirm approval in your wallet...");  
       try {  
         const token = new ethers.Contract(TOKEN_ADDRESS, ERC20_ABI, signer);  
-        const tx = await token.approve(COINFLIP_ADDRESS, ethers.MaxUint256);  
-        setBusyLabel("Approving...");  
-        await tx.wait();  
-        await refreshData();  
+        const tx = await token.approve(COINFLIP_ADDRESS, ethers.MaxUint256);
+
+setBusyLabel("Approval submitted...");
+
+// Tunggu allowance benar-benar berubah di chain.
+// Polling lebih responsif daripada menunggu provider.wait().
+let approved = false;
+
+for (let i = 0; i < 60; i++) {
+  await new Promise(resolve => setTimeout(resolve, 500));
+
+  const currentAllowance = await token.allowance(
+    await signer.getAddress(),
+    COINFLIP_ADDRESS
+  );
+
+  if (currentAllowance >= betUnits) {
+    approved = true;
+    setAllowance(currentAllowance);
+    break;
+  }
+}
+
+if (!approved) {
+  throw new Error("Approval is taking too long. Please try again.");
+}
+
+await refreshData();  
       } catch (err) {  
         setError(err?.info?.error?.message || err?.shortMessage || err.message || "Approve failed.");  
       } finally {  
