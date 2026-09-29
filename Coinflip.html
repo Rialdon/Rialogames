@@ -106,7 +106,7 @@
 <script type="text/plain" id="app-source">
   const { useState, useEffect, useCallback, useMemo, useRef } = React;
 
-  const COINFLIP_ADDRESS = "0x869afB4A96fDe446825fD148dC25da0463192D30";
+  const COINFLIP_ADDRESS = "0x63F6E12f742704749529dd66aeff46941c1e1b71";
   const TOKEN_ADDRESS    = "0x12934cb5e37e1eeec80e889df7614febe312ecd9";
   const TOKEN_SYMBOL     = "RIALO";
   const SEPOLIA_CHAIN_ID_HEX = "0xaa36a7";
@@ -123,6 +123,9 @@
 
   const COINFLIP_ABI = [
     "function placeBet(uint256 amount, bool guessHeads) external returns (uint256 betId)",
+    "function resolveBet(uint256 betId) external",
+    "function claimRefund(uint256 betId) external",
+    "function isResolvable(uint256 betId) view returns (bool)",
     "function getBetTiers() view returns (uint256[])",
     "function isValidBet(uint256 amount) view returns (bool)",
     "function paused() view returns (bool)",
@@ -187,7 +190,7 @@
       const swapTimer = setTimeout(() => {
         setDisplayFace(face);
         setSquished(false);
-      }, 320); // half of the 0.32s scaleX transition below — swap happens while fully squished (invisible edge-on)
+      }, 320);
       return () => clearTimeout(swapTimer);
     }, [face]);
 
@@ -209,9 +212,6 @@
           boxShadow: `inset 0 0 0 6px ${isTails ? "rgba(183,121,31,0.06)" : "rgba(13,148,136,0.06)"}`,
           transform: squished ? "scaleX(0.04)" : "scaleX(1)",
           transition: "transform 0.32s ease-in-out",
-          // The continuous idle spin only runs when NOT mid-reveal-squish,
-          // so the two animation mechanisms never fight over the same
-          // property at the same time.
           animation: (spinning && !squished) ? "coinSquishSpin 0.7s linear infinite" : "none",
         }}>
           <img
@@ -596,18 +596,14 @@
 
         setAnimGen((g) => g + 1);
 
-        // --- The ONLY transaction the player signs. It only moves the bet
-        // amount into the contract and requests randomness from Chainlink
-        // VRF — it never reveals the outcome, so its wallet preview will
-        // only ever show "-amount".
+        // --- Place the bet.
         setApproving(true);
         setBusyLabel("Confirm your bet in your wallet...");
         const placeTx = await game.placeBet(betUnits, guess === "heads");
         setApproving(false);
 
-        // Start a continuous idle spin now — it keeps spinning while we wait
-        // for placeBet to confirm AND while we wait for our own resolver bot
-        // to settle the bet, instead of stopping after a short animation.
+        // Start a continuous idle spin while the bet is being confirmed
+        // and while waiting until the contract allows resolveBet().
         setBusyLabel("Placing bet...");
         setWaitingVrf(true);
         const placeReceipt = await placeTx.wait();
@@ -622,25 +618,51 @@
             }
           } catch (_) {}
         }
-        if (betId === null) throw new Error("Could not find BetPlaced event — bet may not have been recorded.");
 
-        // Immediately resync the PLAYER's own balance/allowance since the
-        // bet amount already left their wallet at this point — that's
-        // expected and fine to show right away. Deliberately NOT calling
-        // refreshPublicData() here: house balance only becomes meaningful
-        // once the bet is settled, so we leave it untouched until then to
-        // avoid it visibly changing before the result is shown.
+        if (betId === null) {
+          throw new Error("Could not find BetPlaced event — bet may not have been recorded.");
+        }
+
+        // Immediately resync the player's own balance/allowance since the
+        // bet amount already left their wallet at this point.
         refreshAccountData();
 
-        // --- Wait for our own resolver bot to settle the bet on its own.
-        // This is a plain read-only poll (getBet). No transaction, no wallet
-        // popup, nothing for the player to sign or preview here — the result
-        // simply appears once the bot has written it on-chain. The coin
-        // keeps idle-spinning the whole time (waitingVrf stays true).
+        // Wait until the contract says this bet can be resolved.
+        // The contract requires:
+        // block.number > targetBlock
+        // and blockhash(targetBlock) != bytes32(0)
         setBusyLabel("Waiting for the result...");
+
         let bet = await gameRead.getBet(betId);
+
         while (!bet.resolved) {
-          await new Promise((resolve) => setTimeout(resolve, RESOLVE_POLL_INTERVAL_MS));
+          const resolvable = await gameRead.isResolvable(betId);
+
+          if (resolvable) {
+            break;
+          }
+
+          await new Promise((resolve) =>
+            setTimeout(resolve, RESOLVE_POLL_INTERVAL_MS)
+          );
+
+          bet = await gameRead.getBet(betId);
+        }
+
+        // If it has not already been resolved, resolve it now.
+        // This is a separate on-chain transaction and requires wallet
+        // confirmation.
+        if (!bet.resolved) {
+          setApproving(true);
+          setBusyLabel("Confirm result in your wallet...");
+
+          const resolveTx = await game.resolveBet(betId);
+
+          setApproving(false);
+          setBusyLabel("Resolving bet...");
+
+          await resolveTx.wait();
+
           bet = await gameRead.getBet(betId);
         }
 
@@ -648,23 +670,22 @@
         const won = bet.won;
         const payout = bet.payout;
 
-
-        // Now that the real result is known: stop the idle spin, kick off a
-        // single discrete flip animation landing on the CORRECT face, and
-        // wait for that animation to actually finish before showing the
-        // "You won/lost" text — so the text and the coin are never out of
-        // sync, unlike before where the text could appear mid-spin.
         setWaitingVrf(false);
         setBusyLabel("Revealing result...");
         setFlipping(true);
-        setCoinFace(faceResult); // Coin component squishes, swaps to the correct image, then un-squishes on its own
-        await new Promise((resolve) => setTimeout(resolve, 700)); // matches the coin's squish-reveal duration
+        setCoinFace(faceResult);
 
-        setResult({ won, payout, txHash: placeReceipt.hash });
-        // Only now — after the result is already known and shown — refresh
-        // everything including house balance.
+        await new Promise((resolve) => setTimeout(resolve, 700));
+
+        setResult({
+          won,
+          payout,
+          txHash: placeReceipt.hash
+        });
+
         await refreshData();
         await loadHistory();
+
       } catch (err) {
         const raw = err?.info?.error?.message || err?.shortMessage || err.message || "Transaction failed.";
         setError(raw);
